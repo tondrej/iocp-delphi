@@ -82,8 +82,6 @@ type
 implementation
 
 const
-  ERROR_ABANDONED_WAIT_0 = 735;
-
   CompletionKeyShutDown = 0;
 
 function ThreadPoolWorker(ThreadPool: TThreadPool): Cardinal; stdcall;
