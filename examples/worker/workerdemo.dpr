@@ -92,7 +92,7 @@ const
   TaskCount = 1024;
 var
   ThreadPool: TThreadPool;
-  I: Integer;
+  I: NativeUInt;
 begin
   Randomize;
   ThreadPool := TThreadPool.Create(64, 32); // optional: override the thread count defaults
