@@ -43,6 +43,7 @@ SOFTWARE.
     {$define HAS_NATIVEUINT}
   {$endif}
   {$ifdef DELPHI2009_UP}
+    {$define HAS_ANSISTRINGS}
     {$define HAS_RAWBYTESTRING}
   {$endif}
   {$ifdef DELPHIXE2_UP}
@@ -50,5 +51,6 @@ SOFTWARE.
   {$endif}
   {$ifdef DELPHI2007_UP}
     {$define HAS_WIDESTRUTILS}
+    {$define HAS_RAISELASTOSERROR}
   {$endif}
 {$endif}

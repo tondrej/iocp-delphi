@@ -95,6 +95,11 @@ var
 procedure InitCriticalSection(var Lock: TRTLCriticalSection);
 procedure DoneCriticalSection(var Lock: TRTLCriticalSection);
 
+{$ifndef HAS_RAISELASTOSERROR}
+procedure RaiseLastOSError; overload;
+procedure RaiseLastOSError(LastError: Cardinal); overload;
+{$endif}
+
 {$ifndef HAS_WIDESTRUTILS}
 function WideStringReplace(const S, OldPattern, NewPattern: Widestring; Flags: TReplaceFlags): Widestring;
 {$endif}
@@ -107,8 +112,8 @@ var
 
 implementation
 
-{$ifdef FPC}
 uses
+{$ifdef FPC}
   {$ifdef WINDOWS}
   winpeimagereader,
   {$endif}
@@ -119,6 +124,8 @@ uses
   machoreader,
   {$endif}
   fileinfo;
+{$else}
+  SysConst;
 {$endif}
 
 {$ifdef FPC}
@@ -159,6 +166,26 @@ procedure DoneCriticalSection(var Lock: TRTLCriticalSection);
 begin
   Windows.DeleteCriticalSection(Lock);
 end;
+
+{$ifndef HAS_RAISELASTOSERROR}
+procedure RaiseLastOSError;
+begin
+  SysUtils.RaiseLastOSError;
+end;
+
+procedure RaiseLastOSError(LastError: Cardinal);
+var
+  Error: EOSError;
+begin
+  if LastError <> 0 then
+    Error := EOSError.CreateResFmt(@SOSError, [LastError,
+      SysErrorMessage(LastError)])
+  else
+    Error := EOSError.CreateRes(@SUnkOSError);
+  Error.ErrorCode := LastError;
+  raise Error;
+end;
+{$endif}
 
 {$ifndef HAS_WIDESTRUTILS}
 function WideStringReplace(const S, OldPattern, NewPattern: Widestring; Flags: TReplaceFlags): Widestring;
@@ -275,3 +302,5 @@ initialization
 finalization
 
 end.
+
+
