@@ -45,8 +45,8 @@ const
   PIPE_REJECT_REMOTE_CLIENTS = 8;
   PIPE_UNLIMITED_INSTANCES = 255;
 
-  InstanceCount = 4;
-  MaxBufferSize = 4096;
+  InstanceCount = 128;
+  MaxBufferSize = 1024;
 
 type
   TOperation = (opConnect, opRead, opWrite);
@@ -59,13 +59,20 @@ type
     Buffer: array[0..MaxBufferSize - 1] of AnsiChar;
   end;
 
+  TInfoProc = procedure (Info: PPipeInfo; BytesTransferred: Cardinal = 0; Callback: Boolean = False; E: Exception = nil);
+
 const
-  OpStrings: array[TOperation] of AnsiString = ('connect', 'read', 'write');
+  OpStrings: array[TOperation, Boolean] of string = (
+    ('connecting', 'connected'),
+    ('reading', 'read'),
+    ('writing', 'written')
+  );
   PipeName = '\\.\pipe\ASYNCPIPE';
 
 var
   Pool: TThreadPool;
   ServerList: TThreadList;
+  InfoProc: TInfoProc = nil;
 
 procedure Server_Handler(BytesTransferred: Cardinal; Overlapped: POverlapped; E: Exception); forward;
 
@@ -81,28 +88,10 @@ begin
   FreeMem(Info);
 end;
 
-procedure RequestConnect(Info: PPipeInfo; HandlerProc: TWorkerProc); overload;
-var
-  LastError: Cardinal;
-begin
-  Info^.Operation := opConnect;
-  if ConnectNamedPipe(Info^.Handle, Pointer(Info)) then // connected synchronously
-    // nothing to do, callback invoked by IOCP
-  else
-  begin
-    LastError := GetLastError;
-    case LastError of
-      ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING, ERROR_IO_PENDING:
-        ;
-      else
-        RaiseLastOSError(LastError);
-    end;
-  end;
-end;
-
-procedure RequestConnect(HandlerProc: TWorkerProc); overload;
+procedure RequestConnect(HandlerProc: TWorkerProc);
 var
   Info: PPipeInfo;
+  LastError: Cardinal;
 begin
   Info := AllocMem(SizeOf(TPipeInfo));
   try
@@ -113,24 +102,40 @@ begin
       RaiseLastOSError;
 
     Pool.Bind(Server_Handler, Info^.Handle);
+
     with ServerList.LockList do
       try
         Add(Info);
       finally
         ServerList.UnlockList;
       end;
-    RequestConnect(Info, HandlerProc);
+
+    Info^.Operation := opConnect;
+    if ConnectNamedPipe(Info^.Handle, Pointer(Info)) then // connected synchronously
+      // nothing to do, callback invoked by IOCP
+    else
+    begin
+      LastError := GetLastError;
+      case LastError of
+        ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING, ERROR_IO_PENDING:
+          ;
+        else
+          RaiseLastOSError(LastError);
+      end;
+    end;
   except
     FreeMem(Info);
     raise;
   end;
 end;
 
-function RequestRead(Info: PPipeInfo; HandlerProc: TWorkerProc): Boolean;
+function RequestRead(Info: PPipeInfo): Boolean;
 var
   BytesRead, LastError: Cardinal;
 begin
   Info^.Operation := opRead;
+  if Assigned(InfoProc) then
+    InfoProc(Info);
   BytesRead := 0;
   Result := ReadFile(Info^.Handle, Info^.Buffer, MaxBufferSize, BytesRead, Pointer(Info));
   if Result then // read completed synchronously
@@ -143,11 +148,13 @@ begin
   end;
 end;
 
-function RequestWrite(Info: PPipeInfo; HandlerProc: TWorkerProc): Boolean;
+function RequestWrite(Info: PPipeInfo): Boolean;
 var
   BytesWritten, LastError: Cardinal;
 begin
   Info^.Operation := opWrite;
+  if Assigned(InfoProc) then
+    InfoProc(Info);
   BytesWritten := 0;
   Result := WriteFile(Info^.Handle, Info^.Buffer, {$ifdef HAS_ANSISTRINGS}AnsiStrings.{$endif}StrLen(Info^.Buffer) + 1,
     BytesWritten, Pointer(Info));
@@ -165,9 +172,11 @@ procedure Server_Handler(BytesTransferred: Cardinal; Overlapped: POverlapped; E:
 var
   Info: PPipeInfo absolute Overlapped;
 begin
+  if Assigned(InfoProc) then
+    InfoProc(Info, BytesTransferred, True, E);
+
   if Assigned(E) then
   begin
-    OutputDebugString(PChar(Format('Server %u %s [%s] %s', [Info^.Handle, OpStrings[Info^.Operation], E.ClassName, E.Message])));
     E.Free;
     Disconnect(Info);
     RequestConnect(Server_Handler);
@@ -176,15 +185,7 @@ begin
 
   case Info^.Operation of
     opConnect:
-      OutputDebugString(PChar(Format('Server %u %s', [Info^.Handle, OpStrings[Info^.Operation]])));
-    else
-      OutputDebugString(PChar(Format('Server %u %s %u bytes: ''%s''', [Info^.Handle, OpStrings[Info^.Operation],
-        BytesTransferred, Info^.Buffer])));
-  end;
-
-  case Info^.Operation of
-    opConnect:
-      RequestRead(Info, Server_Handler);
+      RequestRead(Info);
     opRead:
       begin
 {$ifdef HAS_ANSISTRINGS}
@@ -192,42 +193,38 @@ begin
 {$else}
         StrLCopy(Info^.Buffer, PAnsiChar(UpperCase(Info^.Buffer)), MaxBufferSize - 1);
 {$endif}
-        RequestWrite(Info, Server_Handler);
+        RequestWrite(Info);
       end;
     opWrite:
-      RequestRead(Info, Server_Handler);
+      RequestRead(Info);
   end;
 end;
 
-procedure Client_Handler(BytesTransferred: Cardinal; Overlapped: POverlapped; E: Exception);
+procedure ServerInfoProc(Info: PPipeInfo; BytesTransferred: Cardinal; Callback: Boolean; E: Exception);
 var
-  Info: PPipeInfo absolute Overlapped;
+  SBytes, SData: string;
 begin
-  OutputDebugString(PChar(Format('[%u] %u bytes %s', [GetCurrentThreadId, BytesTransferred, OpStrings[Info^.Operation]])));
+  SBytes := '';
+  SData := '';
+  if Callback then
+    SBytes := Format(' (%u bytes)', [BytesTransferred]);
+
   if Assigned(E) then
+    WriteLn(Format('[%s][%u] server %u %s: [%s] %s', [FormatDateTime('hh:nn:ss.zzz', Now),
+      GetCurrentThreadId, Info^.Handle, OpStrings[Info^.Operation, Callback] + SBytes, E.ClassName, E.Message]))
+  else
   begin
-    Writeln(Format('Client %u %s [%s] %s', [Info^.Handle, OpStrings[Info^.Operation], E.ClassName, E.Message]));
-    E.Free;
-    Exit;
-  end;
+    if Callback or (Info^.Operation = opWrite) then
+      SData := Format(' ''%s''', [PAnsiChar(Info^.Buffer)]);
 
-  Writeln(Format('[%u] Client %u %s %u bytes: ''%s''', [GetCurrentThreadId, Info^.Handle, OpStrings[Info^.Operation], BytesTransferred,
-    Info^.Buffer]));
-
-  case Info^.Operation of
-    opRead:
-      begin
-{$ifdef HAS_ANSISTRINGS}
-        AnsiStrings.StrLCopy(Info^.Buffer, PAnsiChar(AnsiString(Format('%s Hello',
-          [FormatDateTime('hh:nn:ss.zzz', Now)]))), MaxBufferSize - 1);
-{$else}
-        StrLCopy(Info^.Buffer, PAnsiChar(AnsiString(Format('%s Hello',
-          [FormatDateTime('hh:nn:ss.zzz', Now)]))), MaxBufferSize - 1);
-{$endif}
-        RequestWrite(Info, Client_Handler);
-      end;
-    opWrite:
-      RequestRead(Info, Client_Handler);
+    case Info^.Operation of
+      opWrite, opRead:
+        WriteLn(Format('[%s][%u] server %u %s' + SData, [FormatDateTime('hh:nn:ss.zzz', Now),
+          GetCurrentThreadId, Info^.Handle, OpStrings[Info^.Operation, Callback] + SBytes, PAnsiChar(Info^.Buffer)]));
+      else
+        WriteLn(Format('[%s][%u] server %u %s', [FormatDateTime('hh:nn:ss.zzz', Now),
+          GetCurrentThreadId, Info^.Handle, OpStrings[Info^.Operation, Callback]]));
+    end;
   end;
 end;
 
@@ -235,6 +232,7 @@ procedure ServerMain;
 var
   I: Integer;
 begin
+  InfoProc := ServerInfoProc;
   ServerList := nil;
   Pool := TThreadPool.Create;
   try
@@ -269,12 +267,69 @@ begin
   end;
 end;
 
+procedure NewRequest(Info: PPipeInfo);
+var
+  SHello: AnsiString;
+begin
+  SHello := Format('Hello %d', [Random(101)]);
+  {$ifdef HAS_ANSISTRINGS}AnsiStrings.{$endif}StrLCopy(Info^.Buffer, PAnsiChar(SHello), MaxBufferSize - 1);
+end;
+
+procedure Client_Handler(BytesTransferred: Cardinal; Overlapped: POverlapped; E: Exception);
+var
+  Info: PPipeInfo absolute Overlapped;
+begin
+  if Assigned(InfoProc) then
+    InfoProc(Info, BytesTransferred, True, E);
+
+  if Assigned(E) then
+  begin
+    E.Free;
+    Exit;
+  end;
+
+  case Info^.Operation of
+    opRead:
+      begin
+        NewRequest(Info);
+        RequestWrite(Info);
+      end;
+    opWrite:
+      RequestRead(Info);
+  end;
+end;
+
+procedure ClientInfoProc(Info: PPipeInfo; BytesTransferred: Cardinal; Callback: Boolean; E: Exception);
+var
+  SBytes, SData: string;
+begin
+  SBytes := '';
+  SData := '';
+  if Callback then
+    SBytes := Format(' (%u bytes)', [BytesTransferred]);
+
+  if Assigned(E) then
+    WriteLn(Format('[%s][%u] client %u %s: [%s] %s', [FormatDateTime('hh:nn:ss.zzz', Now), GetCurrentThreadId,
+      Info^.Handle, OpStrings[Info^.Operation, Callback] + SBytes, E.ClassName, E.Message]))
+  else
+  begin
+    if Callback or (Info^.Operation = opWrite) then
+      SData := Format(' ''%s''', [PAnsiChar(Info^.Buffer)]);
+
+    WriteLn(Format('[%s][%u] client %u %s' + SData, [FormatDateTime('hh:nn:ss.zzz', Now), GetCurrentThreadId,
+      Info^.Handle, OpStrings[Info^.Operation, Callback] + SBytes]));
+  end;
+end;
+
 procedure ClientMain;
 var
   ClientHandle: THandle;
   Info: PPipeInfo;
   PipeState: Cardinal;
 begin
+  Randomize;
+  InfoProc := ClientInfoProc;
+
   Info := nil;
   Pool := nil;
   try
@@ -284,8 +339,6 @@ begin
     if ClientHandle = INVALID_HANDLE_VALUE then
       RaiseLastOSError;
     try
-      Writeln(Format('Client: %u', [NativeInt(ClientHandle)]));
-
       PipeState := PIPE_READMODE_MESSAGE;
       Win32Check(SetNamedPipeHandleState(ClientHandle, PipeState, nil, nil));
 
@@ -295,14 +348,8 @@ begin
       Info^.Handle := ClientHandle;
       Info^.Operation := opWrite;
 
-{$ifdef HAS_ANSISTRINGS}
-      AnsiStrings.StrLCopy(Info^.Buffer, PAnsiChar(AnsiString(Format('%s Hello',
-        [FormatDateTime('hh:nn:ss.zzz', Now)]))), MaxBufferSize - 1);
-{$else}
-        StrLCopy(Info^.Buffer, PAnsiChar(AnsiString(Format('%s Hello',
-          [FormatDateTime('hh:nn:ss.zzz', Now)]))), MaxBufferSize - 1);
-{$endif}
-      RequestWrite(Info, Client_Handler);
+      NewRequest(Info);
+      RequestWrite(Info);
       Readln;
     finally
       CloseHandle(ClientHandle);
